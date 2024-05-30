@@ -144,6 +144,12 @@ impl<Stream> WebSocket<Stream> {
 }
 
 impl<Stream: Read + Write> WebSocket<Stream> {
+
+    /// Read messages from stream, if possible.
+    pub fn read_messages(&mut self) -> Result<Vec<Message>> {
+        self.context.read_messages(&mut self.socket)
+    }
+
     /// Read a message from stream, if possible.
     ///
     /// This will queue responses to ping and close messages to be sent. It will call
@@ -314,6 +320,22 @@ impl WebSocketContext {
         }
     }
 
+    /// Read messages from the provided stream, if possible.
+    pub fn read_messages<Stream>(&mut self, stream: &mut Stream) -> Result<Vec<Message>>
+        where
+            Stream: Read + Write,
+    {
+        // Do not read from already closed connections.
+        self.state.check_active()?;
+
+        loop {
+            self.write_pending(stream).no_block()?;
+            if let Some(messages) = self.read_message_frames(stream)? {
+                return Ok(messages);
+            }
+        }
+    }
+
     /// Send a message to the provided stream, if possible.
     ///
     /// WebSocket will buffer a configurable number of messages at a time, except to reply to Ping
@@ -421,124 +443,23 @@ impl WebSocketContext {
         self.write_pending(stream)
     }
 
-    /// Try to decode one message frame. May return None.
-    fn read_message_frame<Stream>(&mut self, stream: &mut Stream) -> Result<Option<Message>>
-    where
-        Stream: Read + Write,
+    /// Try to decode message frames. May return None.
+    fn read_message_frames<Stream>(&mut self, stream: &mut Stream) -> Result<Option<Vec<Message>>>
+        where
+            Stream: Read + Write,
     {
-        if let Some(mut frame) = self
+        if let Some(frames) = self
             .frame
-            .read_frame(stream, self.config.max_frame_size)
+            .read_frames(stream, self.config.max_frame_size)
             .check_connection_reset(self.state)?
         {
-            if !self.state.can_read() {
-                return Err(Error::Protocol(ProtocolError::ReceivedAfterClosing));
-            }
-            // MUST be 0 unless an extension is negotiated that defines meanings
-            // for non-zero values.  If a nonzero value is received and none of
-            // the negotiated extensions defines the meaning of such a nonzero
-            // value, the receiving endpoint MUST _Fail the WebSocket
-            // Connection_.
-            {
-                let hdr = frame.header();
-                if hdr.rsv1 || hdr.rsv2 || hdr.rsv3 {
-                    return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
+            let mut messages = Vec::new();
+            for frame in frames {
+                if let Some(message) = self.decode_message(frame)? {
+                    messages.push(message)
                 }
             }
-
-            match self.role {
-                Role::Server => {
-                    if frame.is_masked() {
-                        // A server MUST remove masking for data frames received from a client
-                        // as described in Section 5.3. (RFC 6455)
-                        frame.apply_mask()
-                    } else if !self.config.accept_unmasked_frames {
-                        // The server MUST close the connection upon receiving a
-                        // frame that is not masked. (RFC 6455)
-                        // The only exception here is if the user explicitly accepts given
-                        // stream by setting WebSocketConfig.accept_unmasked_frames to true
-                        return Err(Error::Protocol(ProtocolError::UnmaskedFrameFromClient));
-                    }
-                }
-                Role::Client => {
-                    if frame.is_masked() {
-                        // A client MUST close a connection if it detects a masked frame. (RFC 6455)
-                        return Err(Error::Protocol(ProtocolError::MaskedFrameFromServer));
-                    }
-                }
-            }
-
-            match frame.header().opcode {
-                OpCode::Control(ctl) => {
-                    match ctl {
-                        // All control frames MUST have a payload length of 125 bytes or less
-                        // and MUST NOT be fragmented. (RFC 6455)
-                        _ if !frame.header().is_final => {
-                            Err(Error::Protocol(ProtocolError::FragmentedControlFrame))
-                        }
-                        _ if frame.payload().len() > 125 => {
-                            Err(Error::Protocol(ProtocolError::ControlFrameTooBig))
-                        }
-                        OpCtl::Close => Ok(self.do_close(frame.into_close()?).map(Message::Close)),
-                        OpCtl::Reserved(i) => {
-                            Err(Error::Protocol(ProtocolError::UnknownControlFrameType(i)))
-                        }
-                        OpCtl::Ping => {
-                            let data = frame.into_data();
-                            // No ping processing after we sent a close frame.
-                            if self.state.is_active() {
-                                self.pong = Some(Frame::pong(data.clone()));
-                            }
-                            Ok(Some(Message::Ping(data)))
-                        }
-                        OpCtl::Pong => Ok(Some(Message::Pong(frame.into_data()))),
-                    }
-                }
-
-                OpCode::Data(data) => {
-                    let fin = frame.header().is_final;
-                    match data {
-                        OpData::Continue => {
-                            if let Some(ref mut msg) = self.incomplete {
-                                msg.extend(frame.into_data(), self.config.max_message_size)?;
-                            } else {
-                                return Err(Error::Protocol(
-                                    ProtocolError::UnexpectedContinueFrame,
-                                ));
-                            }
-                            if fin {
-                                Ok(Some(self.incomplete.take().unwrap().complete()?))
-                            } else {
-                                Ok(None)
-                            }
-                        }
-                        c if self.incomplete.is_some() => {
-                            Err(Error::Protocol(ProtocolError::ExpectedFragment(c)))
-                        }
-                        OpData::Text | OpData::Binary => {
-                            let msg = {
-                                let message_type = match data {
-                                    OpData::Text => IncompleteMessageType::Text,
-                                    OpData::Binary => IncompleteMessageType::Binary,
-                                    _ => panic!("Bug: message is not text nor binary"),
-                                };
-                                let mut m = IncompleteMessage::new(message_type);
-                                m.extend(frame.into_data(), self.config.max_message_size)?;
-                                m
-                            };
-                            if fin {
-                                Ok(Some(msg.complete()?))
-                            } else {
-                                self.incomplete = Some(msg);
-                                Ok(None)
-                            }
-                        }
-                        OpData::Reserved(i) => {
-                            Err(Error::Protocol(ProtocolError::UnknownDataFrameType(i)))
-                        }
-                    }
-                }
-            } // match opcode
+            Ok(Some(messages))
         } else {
             // Connection closed by peer
             match replace(&mut self.state, WebSocketState::Terminated) {
@@ -548,6 +469,140 @@ impl WebSocketContext {
                 _ => Err(Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)),
             }
         }
+    }
+
+
+    /// Try to decode one message frame. May return None.
+    fn read_message_frame<Stream>(&mut self, stream: &mut Stream) -> Result<Option<Message>>
+    where
+        Stream: Read + Write,
+    {
+        if let Some(frame) = self
+            .frame
+            .read_frame(stream, self.config.max_frame_size)
+            .check_connection_reset(self.state)?
+        {
+            self.decode_message(frame)
+        } else {
+            // Connection closed by peer
+            match replace(&mut self.state, WebSocketState::Terminated) {
+                WebSocketState::ClosedByPeer | WebSocketState::CloseAcknowledged => {
+                    Err(Error::ConnectionClosed)
+                }
+                _ => Err(Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)),
+            }
+        }
+    }
+
+    fn decode_message(&mut self, mut frame: Frame) -> Result<Option<Message>> {
+        if !self.state.can_read() {
+            return Err(Error::Protocol(ProtocolError::ReceivedAfterClosing));
+        }
+        // MUST be 0 unless an extension is negotiated that defines meanings
+        // for non-zero values.  If a nonzero value is received and none of
+        // the negotiated extensions defines the meaning of such a nonzero
+        // value, the receiving endpoint MUST _Fail the WebSocket
+        // Connection_.
+        {
+            let hdr = frame.header();
+            if hdr.rsv1 || hdr.rsv2 || hdr.rsv3 {
+                return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
+            }
+        }
+
+        match self.role {
+            Role::Server => {
+                if frame.is_masked() {
+                    // A server MUST remove masking for data frames received from a client
+                    // as described in Section 5.3. (RFC 6455)
+                    frame.apply_mask()
+                } else if !self.config.accept_unmasked_frames {
+                    // The server MUST close the connection upon receiving a
+                    // frame that is not masked. (RFC 6455)
+                    // The only exception here is if the user explicitly accepts given
+                    // stream by setting WebSocketConfig.accept_unmasked_frames to true
+                    return Err(Error::Protocol(ProtocolError::UnmaskedFrameFromClient));
+                }
+            }
+            Role::Client => {
+                if frame.is_masked() {
+                    // A client MUST close a connection if it detects a masked frame. (RFC 6455)
+                    return Err(Error::Protocol(ProtocolError::MaskedFrameFromServer));
+                }
+            }
+        }
+
+        match frame.header().opcode {
+            OpCode::Control(ctl) => {
+                match ctl {
+                    // All control frames MUST have a payload length of 125 bytes or less
+                    // and MUST NOT be fragmented. (RFC 6455)
+                    _ if !frame.header().is_final => {
+                        Err(Error::Protocol(ProtocolError::FragmentedControlFrame))
+                    }
+                    _ if frame.payload().len() > 125 => {
+                        Err(Error::Protocol(ProtocolError::ControlFrameTooBig))
+                    }
+                    OpCtl::Close => Ok(self.do_close(frame.into_close()?).map(Message::Close)),
+                    OpCtl::Reserved(i) => {
+                        Err(Error::Protocol(ProtocolError::UnknownControlFrameType(i)))
+                    }
+                    OpCtl::Ping => {
+                        let data = frame.into_data();
+                        // No ping processing after we sent a close frame.
+                        if self.state.is_active() {
+                            self.pong = Some(Frame::pong(data.clone()));
+                        }
+                        Ok(Some(Message::Ping(data)))
+                    }
+                    OpCtl::Pong => Ok(Some(Message::Pong(frame.into_data()))),
+                }
+            }
+
+            OpCode::Data(data) => {
+                let fin = frame.header().is_final;
+                match data {
+                    OpData::Continue => {
+                        if let Some(ref mut msg) = self.incomplete {
+                            msg.extend(frame.into_data(), self.config.max_message_size)?;
+                        } else {
+                            return Err(Error::Protocol(
+                                ProtocolError::UnexpectedContinueFrame,
+                            ));
+                        }
+                        if fin {
+                            Ok(Some(self.incomplete.take().unwrap().complete()?))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    c if self.incomplete.is_some() => {
+                        Err(Error::Protocol(ProtocolError::ExpectedFragment(c)))
+                    }
+                    OpData::Text | OpData::Binary => {
+                        let msg = {
+                            let message_type = match data {
+                                OpData::Text => IncompleteMessageType::Text,
+                                OpData::Binary => IncompleteMessageType::Binary,
+                                _ => panic!("Bug: message is not text nor binary"),
+                            };
+                            let mut m = IncompleteMessage::new(message_type);
+                            m.extend(frame.into_data(), self.config.max_message_size)?;
+                            m
+                        };
+                        if fin {
+                            Ok(Some(msg.complete()?))
+                        } else {
+                            self.incomplete = Some(msg);
+                            Ok(None)
+                        }
+                    }
+                    OpData::Reserved(i) => {
+                        Err(Error::Protocol(ProtocolError::UnknownDataFrameType(i)))
+                    }
+                }
+            }
+        } // match opcode
     }
 
     /// Received a close frame. Tells if we need to return a close frame to the user.
@@ -758,6 +813,22 @@ mod tests {
         assert_eq!(socket.read_message().unwrap(), Message::Pong(vec![3]));
         assert_eq!(socket.read_message().unwrap(), Message::Text("Hello, World!".into()));
         assert_eq!(socket.read_message().unwrap(), Message::Binary(vec![0x01, 0x02, 0x03]));
+    }
+
+    #[test]
+    fn receive_messages_at_once() {
+        let incoming = Cursor::new(vec![
+            0x89, 0x02, 0x01, 0x02, 0x8a, 0x01, 0x03, 0x01, 0x07, 0x48, 0x65, 0x6c, 0x6c, 0x6f,
+            0x2c, 0x20, 0x80, 0x06, 0x57, 0x6f, 0x72, 0x6c, 0x64, 0x21, 0x82, 0x03, 0x01, 0x02,
+            0x03,
+        ]);
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, None);
+        assert_eq!(socket.read_messages().unwrap(), vec![
+            Message::Ping(vec![1, 2]),
+            Message::Pong(vec![3]),
+            Message::Text("Hello, World!".into()),
+            Message::Binary(vec![0x01, 0x02, 0x03]),
+        ]);
     }
 
     #[test]

@@ -165,6 +165,70 @@ impl FrameCodec {
         Ok(Some(frame))
     }
 
+    /// Read frames from the provided stream.
+    pub(super) fn read_frames<Stream>(
+        &mut self,
+        stream: &mut Stream,
+        max_size: Option<usize>,
+    ) -> Result<Option<Vec<Frame>>>
+        where
+            Stream: Read,
+    {
+        let max_size = max_size.unwrap_or_else(usize::max_value);
+        let mut frames = Vec::new();
+        let mut read_more = true;
+        loop {
+            let cursor = self.in_buffer.as_cursor_mut();
+
+            if self.header.is_none() {
+                self.header = FrameHeader::parse(cursor)?;
+            }
+
+            if let Some((_, ref length)) = self.header {
+                let length = *length;
+
+                // Enforce frame size limit early and make sure `length`
+                // is not too big (fits into `usize`).
+                if length > max_size as u64 {
+                    return Err(Error::Capacity(CapacityError::MessageTooLong {
+                        size: length as usize,
+                        max_size,
+                    }));
+                }
+
+                let input_size = cursor.get_ref().len() as u64 - cursor.position();
+                if length <= input_size {
+                    // No truncation here since `length` is checked above
+                    let mut payload = Vec::with_capacity(length as usize);
+                    if length > 0 {
+                        cursor.take(length).read_to_end(&mut payload)?;
+                    }
+                    let (header, length) = self.header.take().expect("Bug: no frame header");
+                    debug_assert_eq!(payload.len() as u64, length);
+                    let frame = Frame::from_payload(header, payload);
+                    trace!("received frame {}", frame);
+                    frames.push(frame);
+                    self.header = FrameHeader::parse(cursor)?;
+                    if self.header.is_none() {
+                        return Ok(Some(frames))
+                    }
+                } else {
+                    read_more = true;
+                }
+            }
+
+            if read_more {
+                // Not enough data in buffer.
+                let size = self.in_buffer.read_from(stream)?;
+                if size == 0 {
+                    trace!("no frame received");
+                    return Ok(None);
+                }
+                read_more = false;
+            }
+        }
+    }
+
     /// Write a frame to the provided stream.
     pub(super) fn write_frame<Stream>(&mut self, stream: &mut Stream, frame: Frame) -> Result<()>
     where
