@@ -144,7 +144,6 @@ impl<Stream> WebSocket<Stream> {
 }
 
 impl<Stream: Read + Write> WebSocket<Stream> {
-
     /// Read messages from stream, if possible.
     pub fn read_messages(&mut self) -> Result<Vec<Message>> {
         self.context.read_messages(&mut self.socket)
@@ -301,8 +300,8 @@ impl WebSocketContext {
     /// This function sends pong and close responses automatically.
     /// However, it never blocks on write.
     pub fn read_message<Stream>(&mut self, stream: &mut Stream) -> Result<Message>
-    where
-        Stream: Read + Write,
+        where
+            Stream: Read + Write,
     {
         // Do not read from already closed connections.
         self.state.check_active()?;
@@ -345,8 +344,8 @@ impl WebSocketContext {
     /// Note that only the last pong frame is stored to be sent, and only the
     /// most recent pong frame is sent if multiple pong frames are queued.
     pub fn write_message<Stream>(&mut self, stream: &mut Stream, message: Message) -> Result<()>
-    where
-        Stream: Read + Write,
+        where
+            Stream: Read + Write,
     {
         // When terminated, return AlreadyClosed.
         self.state.check_active()?;
@@ -387,8 +386,8 @@ impl WebSocketContext {
 
     /// Flush the pending send queue.
     pub fn write_pending<Stream>(&mut self, stream: &mut Stream) -> Result<()>
-    where
-        Stream: Read + Write,
+        where
+            Stream: Read + Write,
     {
         // First, make sure we have no pending frame sending.
         self.frame.write_pending(stream)?;
@@ -430,8 +429,8 @@ impl WebSocketContext {
     /// There is no need to call it again. Calling this function is
     /// the same as calling `write(Message::Close(..))`.
     pub fn close<Stream>(&mut self, stream: &mut Stream, code: Option<CloseFrame>) -> Result<()>
-    where
-        Stream: Read + Write,
+        where
+            Stream: Read + Write,
     {
         if let WebSocketState::Active = self.state {
             self.state = WebSocketState::ClosedByUs;
@@ -474,8 +473,8 @@ impl WebSocketContext {
 
     /// Try to decode one message frame. May return None.
     fn read_message_frame<Stream>(&mut self, stream: &mut Stream) -> Result<Option<Message>>
-    where
-        Stream: Read + Write,
+        where
+            Stream: Read + Write,
     {
         if let Some(frame) = self
             .frame
@@ -645,8 +644,8 @@ impl WebSocketContext {
 
     /// Send a single pending frame.
     fn send_one_frame<Stream>(&mut self, stream: &mut Stream, mut frame: Frame) -> Result<()>
-    where
-        Stream: Read + Write,
+        where
+            Stream: Read + Write,
     {
         match self.role {
             Role::Server => {}
@@ -725,6 +724,10 @@ mod tests {
     use crate::error::{CapacityError, Error};
 
     use std::{io, io::Cursor};
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::ops::DerefMut;
+    use std::rc::Rc;
 
     struct WriteMoc<Stream>(Stream);
 
@@ -757,6 +760,36 @@ mod tests {
     impl io::Read for WouldBlockStreamMoc {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SharedStreamMoc(Rc<RefCell<Vec<u8>>>);
+
+    impl SharedStreamMoc {
+        fn new(data: Vec<u8>) -> Self {
+            Self(Rc::new(RefCell::new(data)))
+        }
+
+        fn extend(&self, data: &[u8]) {
+            self.0.borrow_mut().extend(data);
+        }
+    }
+
+    impl io::Read for SharedStreamMoc {
+        fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+            let data = std::mem::take(self.0.borrow_mut().deref_mut());
+            buf.write(&data)
+        }
+    }
+
+    impl io::Write for SharedStreamMoc {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().flush()
         }
     }
 
@@ -829,6 +862,40 @@ mod tests {
             Message::Text("Hello, World!".into()),
             Message::Binary(vec![0x01, 0x02, 0x03]),
         ]);
+    }
+
+    #[test]
+    fn receive_messages_at_once_last_partial() {
+        let data = SharedStreamMoc::new(vec![
+            0x82, 0x03, 0x01, 0x02, 0x03, 0x82, 0x03,
+        ]);
+        let mut socket = WebSocket::from_raw_socket(data.clone(), Role::Client, None);
+        assert_eq!(socket.read_messages().unwrap(), vec![
+            Message::Binary(vec![0x01, 0x02, 0x03]),
+        ]);
+        data.extend(&[
+            0x04, 0x05, 0x06
+        ]);
+        assert_eq!(socket.read_messages().unwrap(), vec![
+            Message::Binary(vec![0x04, 0x05, 0x06]),
+        ]);
+    }
+
+    #[test]
+    fn receive_message_last_partial() {
+        let data = SharedStreamMoc::new(vec![
+            0x82, 0x03, 0x01, 0x02, 0x03, 0x82, 0x03,
+        ]);
+        let mut socket = WebSocket::from_raw_socket(data.clone(), Role::Client, None);
+        assert_eq!(socket.read_message().unwrap(),
+            Message::Binary(vec![0x01, 0x02, 0x03]),
+        );
+        data.extend(&[
+            0x04, 0x05, 0x06
+        ]);
+        assert_eq!(socket.read_message().unwrap(),
+            Message::Binary(vec![0x04, 0x05, 0x06]),
+        );
     }
 
     #[test]

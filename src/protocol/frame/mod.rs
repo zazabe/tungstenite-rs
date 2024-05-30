@@ -208,8 +208,18 @@ impl FrameCodec {
                     let frame = Frame::from_payload(header, payload);
                     trace!("received frame {}", frame);
                     frames.push(frame);
-                    self.header = FrameHeader::parse(cursor)?;
-                    if self.header.is_none() {
+
+                    // Check if there's a next full frame
+                    let buffer_contains_full_frame = {
+                        let input_size = cursor.get_ref().len() as u64 - cursor.position();
+                        self.header = FrameHeader::parse(cursor)?;
+                        match &self.header {
+                            None => false,
+                            Some((_, length)) => *length <= input_size
+                        }
+                    };
+
+                    if !buffer_contains_full_frame {
                         return Ok(Some(frames))
                     }
                 } else {
