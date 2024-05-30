@@ -188,7 +188,7 @@ impl FrameHeader {
         // Disallow bad opcode
         match opcode {
             OpCode::Control(Control::Reserved(_)) | OpCode::Data(Data::Reserved(_)) => {
-                return Err(Error::Protocol(ProtocolError::InvalidOpcode(first & 0x0F)))
+                return Err(Error::Protocol(ProtocolError::InvalidOpcode(first & 0x0F)));
             }
             _ => (),
         }
@@ -385,7 +385,11 @@ payload: 0x{}
             // self.mask.map(|mask| format!("{:?}", mask)).unwrap_or("NONE".into()),
             self.len(),
             self.payload.len(),
-            self.payload.iter().map(|byte| format!("{:x}", byte)).collect::<String>()
+            self.payload.iter().fold(String::new(), |mut s, byte| {
+                use std::fmt::Write;
+                let _ = write!(s, "{byte:x}");
+                s
+            })
         )
     }
 }

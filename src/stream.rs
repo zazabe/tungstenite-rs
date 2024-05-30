@@ -59,6 +59,7 @@ where
 }
 
 /// A stream that might be protected with TLS.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum MaybeTlsStream<S: Read + Write> {
     /// Unencrypted socket stream.
