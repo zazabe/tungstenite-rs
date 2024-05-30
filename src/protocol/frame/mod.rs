@@ -15,6 +15,7 @@ use crate::{
     error::{CapacityError, Error, Result},
     ReadBuffer,
 };
+use crate::protocol::frame::coding::{Data, OpCode};
 
 /// A reader and writer for WebSocket frames.
 #[derive(Debug)]
@@ -58,7 +59,7 @@ where
 {
     /// Read a frame from stream.
     pub fn read_frame(&mut self, max_size: Option<usize>) -> Result<Option<Frame>> {
-        self.codec.read_frame(&mut self.stream, max_size)
+        self.codec.read_frame(&mut self.stream, max_size, false)
     }
 }
 
@@ -106,9 +107,92 @@ impl FrameCodec {
             header: None,
         }
     }
-
     /// Read a frame from the provided stream.
     pub(super) fn read_frame<Stream>(
+        &mut self,
+        stream: &mut Stream,
+        max_size: Option<usize>,
+        skip_until_last_frame: bool,
+    ) -> Result<Option<Frame>>
+        where
+            Stream: Read,
+    {
+        if skip_until_last_frame {
+            self.read_until_last_frame(stream, max_size)
+        } else {
+            self.read_next_frame(stream, max_size)
+        }
+    }
+
+    /// Read a frame from the provided stream.
+    pub(super) fn read_until_last_frame<Stream>(
+        &mut self,
+        stream: &mut Stream,
+        max_size: Option<usize>,
+    ) -> Result<Option<Frame>>
+        where
+            Stream: Read,
+    {
+        let max_size = max_size.unwrap_or_else(usize::max_value);
+
+        let payload = loop {
+            {
+                let cursor = self.in_buffer.as_cursor_mut();
+
+                if self.header.is_none() {
+                    self.header = FrameHeader::parse(cursor)?;
+                }
+
+                if let Some((header, length)) = &self.header {
+                    let length = *length;
+                    match header.opcode {
+                        // Next frame already buffered, skip current one
+                        OpCode::Data(Data::Text | Data::Binary) if bytes::Buf::remaining(cursor) > length as usize + frame::FRAME_HEADER_LEN_MAX => {
+                            bytes::Buf::advance(cursor, length as usize);
+                            self.header = None;
+                        }
+                        OpCode::Data(_) |
+                        OpCode::Control(_) => {
+                            // Enforce frame size limit early and make sure `length`
+                            // is not too big (fits into `usize`).
+                            if length > max_size as u64 {
+                                return Err(Error::Capacity(CapacityError::MessageTooLong {
+                                    size: length as usize,
+                                    max_size,
+                                }));
+                            }
+
+                            let input_size = cursor.get_ref().len() as u64 - cursor.position();
+                            if length <= input_size {
+                                // No truncation here since `length` is checked above
+                                let mut payload = Vec::with_capacity(length as usize);
+                                if length > 0 {
+                                    cursor.take(length).read_to_end(&mut payload)?;
+                                }
+                                break payload;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Not enough data in buffer.
+            let size = self.in_buffer.read_from(stream)?;
+            if size == 0 {
+                trace!("no frame received");
+                return Ok(None);
+            }
+        };
+
+        let (header, length) = self.header.take().expect("Bug: no frame header");
+        debug_assert_eq!(payload.len() as u64, length);
+        let frame = Frame::from_payload(header, payload);
+        trace!("received frame {}", frame);
+        Ok(Some(frame))
+    }
+
+    /// Read a frame from the provided stream.
+    pub(super) fn read_next_frame<Stream>(
         &mut self,
         stream: &mut Stream,
         max_size: Option<usize>,

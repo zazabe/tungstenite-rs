@@ -37,6 +37,10 @@ impl<'t> fmt::Display for CloseFrame<'t> {
         write!(f, "{} ({})", self.reason, self.code)
     }
 }
+// frame headers is made of 84 bits max (11 bytes):
+// fin (1 bit) + rsv1,2,3 (3 bits) + opcode (4 bits) + mask (1 bit) + payload length (7+64 bits max) + masking-key (4 bits)
+// see https://datatracker.ietf.org/doc/html/rfc6455#section-5.2
+pub const FRAME_HEADER_LEN_MAX: usize = 11;
 
 /// A struct representing a WebSocket frame header.
 #[allow(missing_copy_implementations)]

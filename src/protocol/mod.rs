@@ -56,6 +56,10 @@ pub struct WebSocketConfig {
     /// some popular libraries that are sending unmasked frames, ignoring the RFC.
     /// By default this option is set to `false`, i.e. according to RFC 6455.
     pub accept_unmasked_frames: bool,
+
+    /// Sets whether to skip buffered frames until the last frame.
+    /// Default: `false`
+    pub skip_until_last_frame: bool,
 }
 
 impl Default for WebSocketConfig {
@@ -65,6 +69,7 @@ impl Default for WebSocketConfig {
             max_message_size: Some(64 << 20),
             max_frame_size: Some(16 << 20),
             accept_unmasked_frames: false,
+            skip_until_last_frame: false,
         }
     }
 }
@@ -428,7 +433,7 @@ impl WebSocketContext {
     {
         if let Some(mut frame) = self
             .frame
-            .read_frame(stream, self.config.max_frame_size)
+            .read_frame(stream, self.config.max_frame_size, self.config.skip_until_last_frame)
             .check_connection_reset(self.state)?
         {
             if !self.state.can_read() {
